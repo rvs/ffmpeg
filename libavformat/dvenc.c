@@ -10,6 +10,7 @@
  *
  * 50 Mbps (DVCPRO50) support
  * Copyright (c) 2006 Daniel Maas <dmaas@maasdigital.com>
+ * FIXME
  *
  * This file is part of FFmpeg.
  *
@@ -38,9 +39,9 @@
 
 struct DVMuxContext {
     const DVprofile*  sys;           /* current DV profile, e.g.: 525/60, 625/50 */
-    int               n_ast;         /* number of stereo audio streams (up to 2) */
-    AVStream         *ast[2];        /* stereo audio streams */
-    AVFifoBuffer     *audio_data[2]; /* FIFO for storing excessive amounts of PCM */
+    int               n_ast;         /* number of stereo audio streams (up to 4) */
+    AVStream         *ast[4];        /* stereo audio streams */
+    AVFifoBuffer     *audio_data[4]; /* FIFO for storing excessive amounts of PCM */
     int               frames;        /* current frame number */
     time_t            start_time;    /* recording start time */
     int               has_audio;     /* frame under contruction has audio */
@@ -116,7 +117,7 @@ static int dv_write_pack(enum dv_pack_type pack_id, DVMuxContext *c, uint8_t* bu
         buf[3] = (1 << 7) | /* res               */
                  (1 << 6) | /* multi-language flag */
                  (c->sys->dsf << 5) | /*  system: 60fields/50fields */
-                 (c->sys->n_difchan & 2); /* definition: 0 -- 25Mbps, 2 -- 50Mbps */
+                 (DV_PROFILE_IS_HD(c->sys) ? 0x3 : c->sys->n_difchan & 2); /* definition: 0 -- 25Mbps, 2 -- 50Mbps, 3 -- 100Mbps */
         buf[4] = (1 << 7) | /* emphasis: 1 -- off */
                  (0 << 6) | /* emphasis time constant: 0 -- reserved */
                  (0 << 3) | /* frequency: 0 -- 48kHz, 1 -- 44,1kHz, 2 -- 32kHz */
@@ -291,12 +292,12 @@ DVMuxContext* dv_init_mux(AVFormatContext* s)
     AVStream *vst = NULL;
     int i;
 
-    /* we support at most 1 video and 2 audio streams */
-    if (s->nb_streams > 3)
+    /* we support at most 1 video and 4 audio streams */
+    if (s->nb_streams > 5)
         return NULL;
 
     c->n_ast  = 0;
-    c->ast[0] = c->ast[1] = NULL;
+    c->ast[0] = c->ast[1] = c->ast[2] = c->ast[3] = NULL;
 
     /* We have to sort out where audio and where video stream is */
     for (i=0; i<s->nb_streams; i++) {
@@ -327,8 +328,9 @@ DVMuxContext* dv_init_mux(AVFormatContext* s)
     if (!c->sys)
         goto bail_out;
 
-    if ((c->n_ast > 1) && (c->sys->n_difchan < 2)) {
-        /* only 1 stereo pair is allowed in 25Mbps mode */
+    if(((c->n_ast > 1) && (c->sys->n_difchan < 2)) ||
+       ((c->n_ast > 2) && (c->sys->n_difchan < 4))) {
+        /* only 1 stereo pair is allowed in 25Mbps mode and 2 pairs in 50Mbps mode */
         goto bail_out;
     }
 
@@ -368,7 +370,7 @@ static int dv_write_header(AVFormatContext *s)
         av_log(s, AV_LOG_ERROR, "Can't initialize DV format!\n"
                     "Make sure that you supply exactly two streams:\n"
                     "     video: 25fps or 29.97fps, audio: 2ch/48kHz/PCM\n"
-                    "     (50Mbps allows an optional second audio stream)\n");
+                    "     (50Mbps allows an optional second audio stream, and 100Mbps allows up to four audio streams)\n");
         return -1;
     }
     return 0;

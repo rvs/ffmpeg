@@ -713,8 +713,13 @@ typedef struct EncBlockInfo {
     int      prev[5];
     int      cur_ac;
     int      cno;
+    int      min_qlevel; /* DV100 only: minimum qlevel (for AC coefficients >255) */
     int      dct_mode;
     DCTELEM  mb[64];
+    /* used by DV100 only: a copy of the weighted and classified but
+       not-yet-quantized AC coefficients. This is necessary for
+       re-quantizing at different steps. */
+    DCTELEM save[64];
     uint8_t  next[64];
     uint8_t  sign[64];
     uint8_t  partial_bit_count;
@@ -777,6 +782,325 @@ static av_always_inline int dv_guess_dct_mode(DVVideoContext *s, uint8_t *data, 
     return 0;
 }
 
+/* After quantization, set the class number by looking at the largest
+   AC component. Increase the class number until it fits in 8 bits. */
+static av_always_inline void dv100_set_cno(EncBlockInfo *bi, int max, int bias)
+{
+    int prev, i;
+    int delta = 0;
+
+    /* starting cno */
+    bi->cno = bias;
+
+    /* bump the class number up if the maximum AC coefficient is too
+       large for 8 bits */
+    while ((max & ~(0xFF)) && (bi->cno < 3)) {
+        bi->cno++;
+        delta++;
+        max >>= 1;
+    }
+
+    /* if cno stays the same, we are done */
+    if(delta == 0)
+        return;
+
+    /* divide AC components by 2^(delta), re-building the run-length table and
+       updating bit_size as we go */
+    bi->bit_size[0] = 4; /* EOB code is 4 bits */
+
+    /* skip through the run-length table, visiting all nonzero components */
+    prev = 0;
+
+    /* visit nonzero components and rescale them */
+    for (i = bi->next[prev]; i < 64; i = bi->next[i]) {
+        bi->mb[i] >>= delta;
+
+        /* clamp to max amplitude */
+        /* (yes, it is possible to hit this even when cno=3!) */
+        if (bi->mb[i] > 255)
+            bi->mb[i] = 255;
+
+        /* maintain run-length table */
+        if (bi->mb[i]) {
+            bi->bit_size[0] += dv_rl2vlc_size(i - prev - 1, bi->mb[i]);
+            prev = i;
+        } else {
+            bi->next[prev] = bi->next[i];
+        }
+    }
+    /*  mark EOB */
+    bi->next[prev] = i;
+}
+
+/* this function just copies the DCT coefficients and performs
+   the initial (non-)quantization. */
+static av_always_inline void dv_set_class_number_hd(DCTELEM* blk, EncBlockInfo* bi,
+                                                    const uint8_t* zigzag_scan, const int *weight, int bias)
+{
+    int i, max = 0;
+
+    /* the first quantization (none at all) */
+    bi->area_q[0] = 1;
+
+    /* LOOP1: weigh AC components and store to save[] */
+    /* (i=0 is the DC component; we only include it to make the
+       number of loop iterations even, for future possible SIMD optimization) */
+    for (i = 0; i < 64; i += 2) {
+        int level0, level1;
+
+        /* get the AC component (in zig-zag order) */
+        level0 = blk[zigzag_scan[i+0]];
+        level1 = blk[zigzag_scan[i+1]];
+
+        /* extract sign and make it the lowest bit */
+        bi->sign[i+0] = (level0>>31)&1;
+        bi->sign[i+1] = (level1>>31)&1;
+
+        /* take absolute value of the level */
+        level0 = FFABS(level0);
+        level1 = FFABS(level1);
+
+        /* weigh it */
+        level0 = (level0*weight[i+0] + 4096 + (1<<17)) >> 18;
+        level1 = (level1*weight[i+1] + 4096 + (1<<17)) >> 18;
+
+        /* save unquantized value */
+        bi->save[i+0] = level0;
+        bi->save[i+1] = level1;
+    }
+
+    /* find max component */
+    for (i = 0; i < 64; i++) {
+        int ac = bi->save[i];
+        if (ac > max)
+            max = ac;
+    }
+
+    /* copy DC component */
+    bi->mb[0] = blk[0];
+
+    /* the EOB code is 4 bits */
+    bi->bit_size[0] = 4;
+    bi->bit_size[1] = bi->bit_size[2] = bi->bit_size[3] = 0;
+
+    /* ensure that no AC coefficients are cut off */
+    bi->min_qlevel = ((max+256) >> 8);
+
+    bi->area_q[0] = 25; /* set to an "impossible" value */
+    bi->cno = 0;
+}
+
+/* DV100 quantize
+   Perform quantization by divinding the AC component by the qstep.
+   As an optimization we use a fixed-point integer multiply instead
+   of a divide. */
+static av_always_inline int dv100_quantize(int level, int qsinv)
+{
+    /* this code is equivalent to */
+    /* return (level + qs/2) / qs; */
+
+    return (level * qsinv + 1024 + (1<<(dv100_qstep_bits-1))) >> dv100_qstep_bits;
+
+    /* the extra +1024 is needed to make the rounding come out right. */
+
+    /* I (Dan Maas) have verified that the results are exactly the same as
+       division for level 0-2048 at all QNOs. */
+}
+
+static int dv100_actual_quantize(EncBlockInfo *b, int qlevel)
+{
+    int prev, k, qsinv;
+
+    int qno = DV100_QLEVEL_QNO(dv100_qlevels[qlevel]);
+    int cno = DV100_QLEVEL_CNO(dv100_qlevels[qlevel]);
+
+    if(b->area_q[0] == qno && b->cno == cno)
+        return b->bit_size[0];
+
+    qsinv = dv100_qstep_inv[qno];
+
+    /* record the new qstep */
+    b->area_q[0] = qno;
+    b->cno = cno;
+
+    /* reset encoded size (EOB = 4 bits) */
+    b->bit_size[0] = 4;
+
+    /* visit nonzero components and quantize */
+    prev = 0;
+    for (k = 1; k < 64; k++) {
+        /* quantize */
+        int ac = dv100_quantize(b->save[k], qsinv) >> cno;
+        if(ac) {
+            if(ac > 255)
+                ac = 255;
+
+            b->mb[k] = ac;
+            b->bit_size[0] += dv_rl2vlc_size(k - prev - 1, ac);
+            b->next[prev] = k;
+            prev = k;
+        }
+    }
+    b->next[prev] = k;
+
+    return b->bit_size[0];
+}
+
+static inline void dv_guess_qnos_hd(EncBlockInfo *blks, int* qnos)
+{
+    EncBlockInfo *b;
+    int vs_total_ac_bits = (68*6 + 52*2) * 5;
+    int qlevels[5] = { dv100_starting_qno, dv100_starting_qno, dv100_starting_qno, dv100_starting_qno, dv100_starting_qno }; 
+    int min_qlevel[5];
+    int size[5];
+    int i, j;
+
+    static const int enable_finer = 1;
+
+    /* cache block sizes at hypothetical qlevels */
+    uint16_t size_cache[5*8][dv100_num_qlevels];
+
+    memset(size_cache, 0, sizeof(size_cache));
+
+    /* get minimum qlevels */
+    for (i = 0; i < 5; i++) {
+        min_qlevel[i] = 1;
+        for (j = 0; j < 8; j++) {
+            if (blks[8*i+j].min_qlevel > min_qlevel[i])
+                min_qlevel[i] = blks[8*i+j].min_qlevel;
+        }
+    }
+
+    /* initialize sizes */
+    for (i = 0; i < 5; i++) {
+        if (qlevels[i] < min_qlevel[i])
+            qlevels[i] = min_qlevel[i];
+
+        qnos[i] = DV100_QLEVEL_QNO(dv100_qlevels[qlevels[i]]);
+        size[i] = 0;
+        for (j = 0; j < 8; j++) {
+            size_cache[8*i+j][qlevels[i]] = dv100_actual_quantize(&blks[8*i+j], qlevels[i]);
+            size[i] += size_cache[8*i+j][qlevels[i]];
+        }
+    }
+
+    /* must we go coarser? */
+    if((size[0]+size[1]+size[2]+size[3]+size[4]) > vs_total_ac_bits) {
+
+        int largest = (size[0] % 5); /* 'random' number */
+
+        do {
+            /* find the macroblock with the lowest qlevel */
+            for (i = 0; i < 5; i++) {
+                if ((qlevels[i] < (dv100_num_qlevels-1)) &&
+                    (qlevels[i] < qlevels[largest]))
+                    largest = i;
+            }
+
+            i = largest;
+
+            /* ensure that we don't enter infinite loop */
+            largest = (largest+1) % 5;
+
+            if (qlevels[i] >= (dv100_num_qlevels-1)) {
+                /* can't quantize any more */
+                continue;
+            }
+
+            /* quantize a little bit more */
+            qlevels[i] += dv100_qlevel_inc;
+            if (qlevels[i] > (dv100_num_qlevels-1))
+                qlevels[i] = dv100_num_qlevels-1;
+
+            qnos[i] = DV100_QLEVEL_QNO(dv100_qlevels[qlevels[i]]);
+            size[i] = 0;
+
+            /* for each block */
+            b = &blks[8*i];
+            for (j = 0; j < 8; j++, b++) {
+                /* accumulate block size into macroblock */
+                if(size_cache[8*i+j][qlevels[i]] == 0) {
+                    /* it is safe to use actual_quantize() here because we only go from finer to coarser,
+                       and it saves the final actual_quantize() down below */
+                    size_cache[8*i+j][qlevels[i]] = dv100_actual_quantize(b, qlevels[i]);
+                }
+                size[i] += size_cache[8*i+j][qlevels[i]];
+            } /* for each block */
+
+        } while ((vs_total_ac_bits < (size[0] + size[1] + size[2] + size[3] + size[4])) &&
+                 ((qlevels[0] < (dv100_num_qlevels-1)) || (qlevels[1] < (dv100_num_qlevels-1)) || (qlevels[2] < (dv100_num_qlevels-1)) || (qlevels[3] < (dv100_num_qlevels-1)) || (qlevels[4] < (dv100_num_qlevels-1))));
+
+    /* can we go finer? */
+    } else if(enable_finer &&
+              ((size[0]+size[1]+size[2]+size[3]+size[4]) < vs_total_ac_bits)) {
+
+        int save_qlevel;
+        int largest = (size[0] % 5); /* 'random' number */
+
+        while((qlevels[0] > min_qlevel[0]) ||
+              (qlevels[1] > min_qlevel[1]) ||
+              (qlevels[2] > min_qlevel[2]) ||
+              (qlevels[3] > min_qlevel[3]) ||
+              (qlevels[4] > min_qlevel[4])) {
+
+            /* find the macroblock with the highest qlevel */
+            for (i = 0; i < 5; i++) {
+                if ((qlevels[i] > min_qlevel[i]) && (qlevels[i] > qlevels[largest]))
+                    largest = i;
+            }
+
+            i = largest;
+
+            /* ensure that we don't enter infinite loop */
+            largest = (largest+1) % 5;
+
+            if (qlevels[i] <= min_qlevel[i]) {
+                /* can't unquantize any more */
+                continue;
+            }
+
+            /* quantize a little bit less */
+            save_qlevel = qlevels[i];
+            qlevels[i] -= dv100_qlevel_inc;
+            if (qlevels[i] < min_qlevel[i])
+                qlevels[i] = min_qlevel[i];
+
+            qnos[i] = DV100_QLEVEL_QNO(dv100_qlevels[qlevels[i]]);
+
+            size[i] = 0;
+
+            /* for each block */
+            b = &blks[8*i];
+            for (j = 0; j < 8; j++, b++) {
+                /* accumulate block size into macroblock */
+                if(size_cache[8*i+j][qlevels[i]] == 0) {
+                    size_cache[8*i+j][qlevels[i]] = dv100_actual_quantize(b, qlevels[i]);
+                }
+                size[i] += size_cache[8*i+j][qlevels[i]];
+            } /* for each block */
+
+            /* did we bust the limit? */
+            if(vs_total_ac_bits < (size[0] + size[1] + size[2] + size[3] + size[4])) {
+                /* go back down and exit */
+                qlevels[i] = save_qlevel;
+                qnos[i] = DV100_QLEVEL_QNO(dv100_qlevels[qlevels[i]]);
+                break;
+            }
+        }
+    }
+
+    /* now do the actual quantization */
+    for(i = 0; i < 5; i++) {
+        /* for each block */
+        b = &blks[8*i];
+        size[i] = 0;
+        for (j = 0; j < 8; j++, b++) {
+            /* accumulate block size into macroblock */
+            size[i] += dv100_actual_quantize(b, qlevels[i]);
+        } /* for each block */
+    }
+}
+
 static av_always_inline int dv_init_enc_block(EncBlockInfo* bi, uint8_t *data, int linesize, DVVideoContext *s, int bias)
 {
     const int *weight;
@@ -808,7 +1132,7 @@ static av_always_inline int dv_init_enc_block(EncBlockInfo* bi, uint8_t *data, i
     bi->partial_bit_buffer = 0;
     bi->cur_ac = 0;
     if (data) {
-        bi->dct_mode = dv_guess_dct_mode(s, data, linesize);
+        bi->dct_mode = !DV_PROFILE_IS_HD(s->sys) && dv_guess_dct_mode(s, data, linesize);
         s->get_pixels(blk, data, linesize);
         s->fdct[bi->dct_mode](blk);
     } else {
@@ -821,6 +1145,15 @@ static av_always_inline int dv_init_enc_block(EncBlockInfo* bi, uint8_t *data, i
 
     zigzag_scan = bi->dct_mode ? ff_zigzag248_direct : ff_zigzag_direct;
     weight = bi->dct_mode ? dv_weight_248 : dv_weight_88;
+    if (DV_PROFILE_IS_HD(s->sys)) {
+       if (s->sys->height == 1080) {
+           weight = !bias ? dv_weight_1080_y : dv_weight_1080_c;
+       } else {
+           weight = !bias ? dv_weight_720_y : dv_weight_720_c;
+       }
+       dv_set_class_number_hd(blk, bi, ff_zigzag_direct, weight, dv100_min_bias + bias*dv100_chroma_bias);
+       goto out;
+    }
 
     for (area = 0; area < 4; area++) {
        bi->prev[area]     = prev;
@@ -868,6 +1201,7 @@ static av_always_inline int dv_init_enc_block(EncBlockInfo* bi, uint8_t *data, i
         bi->next[prev]= i;
     }
 
+out:
     return bi->bit_size[0] + bi->bit_size[1] + bi->bit_size[2] + bi->bit_size[3];
 }
 
@@ -960,18 +1294,29 @@ static int dv_encode_video_segment(AVCodecContext *avctx, void *arg)
     dif = &s->buf[work_chunk->buf_offset*80];
     enc_blk = &enc_blks[0];
     for (mb_index = 0; mb_index < 5; mb_index++) {
+        int is_field_mode = 0;
         dv_calculate_mb_xy(s, work_chunk, mb_index, &mb_x, &mb_y);
 
         /* initializing luminance blocks */
+        y_ptr    = s->picture.data[0] + ((mb_y * s->picture.linesize[0] + mb_x) << 3);
+        /* decide whether to use DV100 field macroblock mode
+           note that 4x1 "bottom macro blocks" cannot use field mode
+           NOTE: some decoders appear not to support field mode in the entire
+           1080i60 A0-A16 or 1080i50 A0-A1 regions, even though not all
+           of those macroblocks are "bottom macro blocks" */
+        if ((s->sys->height == 1080) && (s->avctx->flags & CODEC_FLAG_INTERLACED_DCT) &&
+            ((DV_PROFILE_IS_1080i50(s->sys) && (mb_y != 0) && (mb_y != 134)) ||
+            (DV_PROFILE_IS_1080i60(s->sys) && (mb_y >= 8) && (mb_y < 128))))
+            is_field_mode = dv_guess_dct_mode(s, y_ptr, s->picture.linesize[0]); 
+
         if ((s->sys->pix_fmt == PIX_FMT_YUV420P) ||
             (s->sys->pix_fmt == PIX_FMT_YUV411P && mb_x >= (704 / 8)) ||
             (s->sys->height >= 720 && mb_y != 134)) {
-            y_stride = s->picture.linesize[0] << 3;
+            y_stride = s->picture.linesize[0] << ((!is_field_mode)*3);
         } else {
             y_stride = 16;
         }
-        y_ptr    = s->picture.data[0] + ((mb_y * s->picture.linesize[0] + mb_x) << 3);
-        linesize = s->picture.linesize[0];
+        linesize = s->picture.linesize[0] << is_field_mode;
 
         if (s->sys->video_stype == 4) { /* SD 422 */
             vs_bit_size +=
@@ -986,6 +1331,8 @@ static int dv_encode_video_segment(AVCodecContext *avctx, void *arg)
             dv_init_enc_block(enc_blk+2, y_ptr     + y_stride, linesize, s, 0) +
             dv_init_enc_block(enc_blk+3, y_ptr + 8 + y_stride, linesize, s, 0);
         }
+        if (DV_PROFILE_IS_HD(s->sys))
+            enc_blk[0].dct_mode = is_field_mode; 
         enc_blk += 4;
 
         /* initializing chrominance blocks */
@@ -993,8 +1340,8 @@ static int dv_encode_video_segment(AVCodecContext *avctx, void *arg)
                      (mb_x >> ((s->sys->pix_fmt == PIX_FMT_YUV411P) ? 2 : 1))) << 3);
         for (j = 2; j; j--) {
             uint8_t *c_ptr = s->picture.data[j] + c_offset;
-            linesize = s->picture.linesize[j];
-            y_stride = (mb_y == 134) ? 8 : (s->picture.linesize[j] << 3);
+            linesize = s->picture.linesize[j] << is_field_mode;
+            y_stride = (mb_y == 134) ? 8 : (s->picture.linesize[j] << ((!is_field_mode)*3));
             if (s->sys->pix_fmt == PIX_FMT_YUV411P && mb_x >= (704 / 8)) {
                 uint8_t* d;
                 uint8_t* b = scratch;
@@ -1016,8 +1363,12 @@ static int dv_encode_video_segment(AVCodecContext *avctx, void *arg)
         }
     }
 
+    if (DV_PROFILE_IS_HD(s->sys)) {
+        dv_guess_qnos_hd(&enc_blks[0], qnosp);
+    } else {
     if (vs_total_ac_bits < vs_bit_size)
         dv_guess_qnos(&enc_blks[0], qnosp);
+    }
 
     /* DIF encoding process */
     for (j=0; j<5*s->sys->bpm;) {
@@ -1150,10 +1501,11 @@ static inline int dv_write_pack(enum dv_pack_type pack_id, DVVideoContext *c,
      *   2. It is not at all clear what STYPE is used for 4:2:0 PAL
      *      compression scheme (if any).
      */
-    int apt   = (c->sys->pix_fmt == PIX_FMT_YUV420P ? 0 : 1);
+    int apt = ((c->sys->pix_fmt == PIX_FMT_YUV420P || DV_PROFILE_IS_HD(c->sys)) ? 0 : 1);
 
     uint8_t aspect = 0;
-    if ((int)(av_q2d(c->avctx->sample_aspect_ratio) * c->avctx->width / c->avctx->height * 10) >= 17) /* 16:9 */
+    if (((int)(av_q2d(c->avctx->sample_aspect_ratio) * c->avctx->width / c->avctx->height * 10) >= 17) /* 16:9 */
+        || DV_PROFILE_IS_HD(c->sys)) /* 16:9 */
         aspect = 0x02;
 
     buf[0] = (uint8_t)pack_id;

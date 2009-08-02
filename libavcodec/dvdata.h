@@ -30,6 +30,10 @@
 #include "libavutil/rational.h"
 #include "avcodec.h"
 
+/* setting this to 1 results in a faster codec but
+ * somewhat lower image quality */
+#define DV100_SACRIFICE_QUALITY_FOR_SPEED 1
+
 typedef struct DVwork_chunk {
     uint16_t  buf_offset;
     uint16_t  mb_coordinates[5];
@@ -99,6 +103,98 @@ static const uint8_t dv100_qstep[16] = {
     1, /* QNO = 0 and 1 both have no quantization */
     1,
     2, 3, 4, 5, 6, 7, 8, 16, 18, 20, 22, 24, 28, 52
+};
+
+/* pack combination of QNO and CNO into a single 8-bit value */
+#define DV100_MAKE_QLEVEL(qno,cno) ((qno<<2) | (cno))
+#define DV100_QLEVEL_QNO(qlevel) (qlevel>>2)
+#define DV100_QLEVEL_CNO(qlevel) (qlevel&0x3)
+
+/* The quantization step is determined by a combination of QNO and
+   CNO. We refer to these combinations as "qlevels" (this term is our
+   own, it's not mentioned in the spec). We use CNO, a multiplier on
+   the quantization step, to "fill in the gaps" between quantization
+   steps associated with successive values of QNO. e.g. there is no
+   QNO for a quantization step of 10, but we can use QNO=5 CNO=1 to
+   get the same result. The table below encodes combinations of QNO
+   and CNO in order of increasing quantization coarseness. */
+
+static const uint8_t dv100_qlevels[] = {
+    DV100_MAKE_QLEVEL( 1,0), /*  1*1= 1 */
+    DV100_MAKE_QLEVEL( 1,0), /*  1*1= 1 */
+    DV100_MAKE_QLEVEL( 2,0), /*  2*1= 2 */
+    DV100_MAKE_QLEVEL( 3,0), /*  3*1= 3 */
+    DV100_MAKE_QLEVEL( 4,0), /*  4*1= 4 */
+    DV100_MAKE_QLEVEL( 5,0), /*  5*1= 5 */
+    DV100_MAKE_QLEVEL( 6,0), /*  6*1= 6 */
+    DV100_MAKE_QLEVEL( 7,0), /*  7*1= 7 */
+    DV100_MAKE_QLEVEL( 8,0), /*  8*1= 8 */
+    DV100_MAKE_QLEVEL( 5,1), /*  5*2=10 */
+    DV100_MAKE_QLEVEL( 6,1), /*  6*2=12 */
+    DV100_MAKE_QLEVEL( 7,1), /*  7*2=14 */
+    DV100_MAKE_QLEVEL( 9,0), /* 16*1=16 */
+    DV100_MAKE_QLEVEL(10,0), /* 18*1=18 */
+    DV100_MAKE_QLEVEL(11,0), /* 20*1=20 */
+    DV100_MAKE_QLEVEL(12,0), /* 22*1=22 */
+    DV100_MAKE_QLEVEL(13,0), /* 24*1=24 */
+    DV100_MAKE_QLEVEL(14,0), /* 28*1=28 */
+    DV100_MAKE_QLEVEL( 9,1), /* 16*2=32 */
+    DV100_MAKE_QLEVEL(10,1), /* 18*2=36 */
+    DV100_MAKE_QLEVEL(11,1), /* 20*2=40 */
+    DV100_MAKE_QLEVEL(12,1), /* 22*2=44 */
+    DV100_MAKE_QLEVEL(13,1), /* 24*2=48 */
+    DV100_MAKE_QLEVEL(15,0), /* 52*1=52 */
+    DV100_MAKE_QLEVEL(14,1), /* 28*2=56 */
+    DV100_MAKE_QLEVEL( 9,2), /* 16*4=64 */
+    DV100_MAKE_QLEVEL(10,2), /* 18*4=72 */
+    DV100_MAKE_QLEVEL(11,2), /* 20*4=80 */
+    DV100_MAKE_QLEVEL(12,2), /* 22*4=88 */
+    DV100_MAKE_QLEVEL(13,2), /* 24*4=96 */
+    /* ... */
+    DV100_MAKE_QLEVEL(15,3), /* 52*8=416 */
+};
+
+static const int dv100_num_qlevels = sizeof(dv100_qlevels)/sizeof(dv100_qlevels[0]);
+
+/* how much to increase qlevel when we need to compress more coarsely */
+/* this is a tradeoff between encoding speed and space efficiency */
+/* the highest-quality, lowest-speed option it to use 1 for all qlevels. */
+static const uint8_t dv100_qstep_delta[16] = {
+#if DV100_SACRIFICE_QUALITY_FOR_SPEED
+    0, 2, 0, 5, 0, 0, 0, 0, 1, 6, 0, 0, 0, 0, 0, 0,
+#else
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#endif
+};
+
+/* how much to decrease qlevel when we can compress more finely */
+/* must be the "inverse" of dv100_qstep_delta */
+static const uint8_t dv100_qbackstep_delta[16] = {
+#if DV100_SACRIFICE_QUALITY_FOR_SPEED
+    0, 0, 0, 2, 0, 0, 0, 0, 5, 1, 0, 0, 0, 0, 0, 6,
+#else
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+#endif
+};
+
+#if DV100_SACRIFICE_QUALITY_FOR_SPEED
+static const int dv100_min_bias = 0;
+static const int dv100_chroma_bias = 0;
+static const int dv100_starting_qno = 1;
+static const int dv100_min_qno = 1;
+static const int dv100_qlevel_inc = 4;
+#else
+static const int dv100_min_bias = 0;
+static const int dv100_chroma_bias = 0;
+static const int dv100_starting_qno = 1;
+static const int dv100_min_qno = 1;
+static const int dv100_qlevel_inc = 1;
+#endif
+
+/* 1/qstep, shifted up by 16 bits */
+static const int dv100_qstep_bits = 16;
+static const int dv100_qstep_inv[16] = {
+    65536,  65536,  32768,  21845,  16384,  13107,  10923,  9362,  8192,  4096,  3641,  3277,  2979,  2731,  2341,  1260,
 };
 
 /* DV25/50 DCT coefficient weights and inverse weights */
@@ -236,6 +332,7 @@ enum dv_pack_type {
 
 #define DV_PROFILE_IS_HD(p) ((p)->video_stype & 0x10)
 #define DV_PROFILE_IS_1080i50(p) (((p)->video_stype == 0x14) && ((p)->dsf == 1))
+#define DV_PROFILE_IS_1080i60(p) (((p)->video_stype == 0x14) && ((p)->dsf == 0))
 #define DV_PROFILE_IS_720p50(p)  (((p)->video_stype == 0x18) && ((p)->dsf == 1))
 
 /* minimum number of bytes to read from a DV stream in order to
@@ -260,10 +357,14 @@ static inline int dv_write_dif_id(enum dv_section_type t, uint8_t chan_num,
                                   uint8_t seq_num, uint8_t dif_num,
                                   uint8_t* buf)
 {
+    int fsc = chan_num & 1;
+    int fsp = 1 - (chan_num >> 1);
+
     buf[0] = (uint8_t)t;       /* Section type */
     buf[1] = (seq_num  << 4) | /* DIF seq number 0-9 for 525/60; 0-11 for 625/50 */
-             (chan_num << 3) | /* FSC: for 50Mb/s 0 - first channel; 1 - second */
-             7;                /* reserved -- always 1 */
+             (fsc << 3)      | /* FSC: for 50 and 100Mb/s 0 - first channel; 1 - second */
+             (fsp << 2)      | /* FSP: for 100Mb/s 1 - channels 0-1; 0 - channels 2-3 */
+             3;                /* reserved -- always 1 */
     buf[2] = dif_num;          /* DIF block number Video: 0-134, Audio: 0-8 */
     return 3;
 }
