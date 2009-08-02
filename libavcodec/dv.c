@@ -778,56 +778,6 @@ static av_always_inline int dv_guess_dct_mode(DVVideoContext *s, uint8_t *data, 
     return 0;
 }
 
-/* After quantization, set the class number by looking at the largest
-   AC component. Increase the class number until it fits in 8 bits. */
-static av_always_inline void dv100_set_cno(EncBlockInfo *bi, int max, int bias)
-{
-    int prev, i;
-    int delta = 0;
-
-    /* starting cno */
-    bi->cno = bias;
-
-    /* bump the class number up if the maximum AC coefficient is too
-       large for 8 bits */
-    while ((max & ~(0xFF)) && (bi->cno < 3)) {
-        bi->cno++;
-        delta++;
-        max >>= 1;
-    }
-
-    /* if cno stays the same, we are done */
-    if(delta == 0)
-        return;
-
-    /* divide AC components by 2^(delta), re-building the run-length table and
-       updating bit_size as we go */
-    bi->bit_size[0] = 4; /* EOB code is 4 bits */
-
-    /* skip through the run-length table, visiting all nonzero components */
-    prev = 0;
-
-    /* visit nonzero components and rescale them */
-    for (i = bi->next[prev]; i < 64; i = bi->next[i]) {
-        bi->mb[i] >>= delta;
-
-        /* clamp to max amplitude */
-        /* (yes, it is possible to hit this even when cno=3!) */
-        if (bi->mb[i] > 255)
-            bi->mb[i] = 255;
-
-        /* maintain run-length table */
-        if (bi->mb[i]) {
-            bi->bit_size[0] += dv_rl2vlc_size(i - prev - 1, bi->mb[i]);
-            prev = i;
-        } else {
-            bi->next[prev] = bi->next[i];
-        }
-    }
-    /*  mark EOB */
-    bi->next[prev] = i;
-}
-
 /* this function just copies the DCT coefficients and performs
    the initial (non-)quantization. */
 static av_always_inline void dv_set_class_number_hd(DCTELEM* blk, EncBlockInfo* bi,
