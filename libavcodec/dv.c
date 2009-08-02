@@ -716,10 +716,6 @@ typedef struct EncBlockInfo {
     int      min_qlevel; /* DV100 only: minimum qlevel (for AC coefficients >255) */
     int      dct_mode;
     DCTELEM  mb[64];
-    /* used by DV100 only: a copy of the weighted and classified but
-       not-yet-quantized AC coefficients. This is necessary for
-       re-quantizing at different steps. */
-    DCTELEM save[64];
     uint8_t  next[64];
     uint8_t  sign[64];
     uint8_t  partial_bit_count;
@@ -837,47 +833,35 @@ static av_always_inline void dv100_set_cno(EncBlockInfo *bi, int max, int bias)
 static av_always_inline void dv_set_class_number_hd(DCTELEM* blk, EncBlockInfo* bi,
                                                     const uint8_t* zigzag_scan, const int *weight, int bias)
 {
-    int i, max = 0;
+    int prev, i, max = 0;
 
-    /* the first quantization (none at all) */
-    bi->area_q[0] = 1;
-
-    /* LOOP1: weigh AC components and store to save[] */
-    /* (i=0 is the DC component; we only include it to make the
-       number of loop iterations even, for future possible SIMD optimization) */
-    for (i = 0; i < 64; i += 2) {
-        int level0, level1;
+    prev = 0;
+    for (i = 1; i < 64; i++) {
+        int level0;
 
         /* get the AC component (in zig-zag order) */
         level0 = blk[zigzag_scan[i+0]];
-        level1 = blk[zigzag_scan[i+1]];
 
         /* extract sign and make it the lowest bit */
         bi->sign[i+0] = (level0>>31)&1;
-        bi->sign[i+1] = (level1>>31)&1;
 
         /* take absolute value of the level */
         level0 = FFABS(level0);
-        level1 = FFABS(level1);
 
         /* weigh it */
         level0 = (level0*weight[i+0] + 4096 + (1<<17)) >> 18;
-        level1 = (level1*weight[i+1] + 4096 + (1<<17)) >> 18;
 
-        /* save unquantized value */
-        bi->save[i+0] = level0;
-        bi->save[i+1] = level1;
+        if (level0 + 15 > 30U) {
+            /* save unquantized value */
+            bi->mb[i+0] = level0;
+
+            if (level0 > max)
+                max = level0; 
+            bi->next[prev] = i;
+            prev = i;
+        }
     }
-
-    /* find max component */
-    for (i = 0; i < 64; i++) {
-        int ac = bi->save[i];
-        if (ac > max)
-            max = ac;
-    }
-
-    /* copy DC component */
-    bi->mb[0] = blk[0];
+    bi->next[prev] = i;
 
     /* the EOB code is 4 bits */
     bi->bit_size[0] = 4;
@@ -928,9 +912,44 @@ static int dv100_actual_quantize(EncBlockInfo *b, int qlevel)
 
     /* visit nonzero components and quantize */
     prev = 0;
-    for (k = 1; k < 64; k++) {
+    for (k = b->next[0]; k < 64; k = b->next[k]) {
         /* quantize */
-        int ac = dv100_quantize(b->save[k], qsinv) >> cno;
+        int ac = dv100_quantize(b->mb[k], qsinv) >> cno;
+        if(ac) {
+            if(ac > 255)
+                ac = 255;
+
+            b->bit_size[0] += dv_rl2vlc_size(k - prev - 1, ac);
+            b->next[prev] = k;
+            prev = k;
+        }
+    }
+    b->next[prev] = k;
+
+    return b->bit_size[0];
+}
+
+static int dv100_store_quantize(EncBlockInfo *b, int qlevel)
+{
+    int prev, k, qsinv;
+
+    int qno = DV100_QLEVEL_QNO(dv100_qlevels[qlevel]);
+    int cno = DV100_QLEVEL_CNO(dv100_qlevels[qlevel]);
+
+    qsinv = dv100_qstep_inv[qno];
+
+    /* record the new qstep */
+    b->area_q[0] = qno;
+    b->cno = cno;
+
+    /* reset encoded size (EOB = 4 bits) */
+    b->bit_size[0] = 4;
+
+    /* visit nonzero components and quantize */
+    prev = 0;
+    for (k = b->next[0]; k < 64; k = b->next[k]) {
+        /* quantize */
+        int ac = dv100_quantize(b->mb[k], qsinv) >> cno;
         if(ac) {
             if(ac > 255)
                 ac = 255;
@@ -1096,7 +1115,7 @@ static inline void dv_guess_qnos_hd(EncBlockInfo *blks, int* qnos)
         size[i] = 0;
         for (j = 0; j < 8; j++, b++) {
             /* accumulate block size into macroblock */
-            size[i] += dv100_actual_quantize(b, qlevels[i]);
+            size[i] += dv100_store_quantize(b, qlevels[i]);
         } /* for each block */
     }
 }
