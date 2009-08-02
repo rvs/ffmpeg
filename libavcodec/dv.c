@@ -780,10 +780,14 @@ static av_always_inline int dv_guess_dct_mode(DVVideoContext *s, uint8_t *data, 
 
 /* this function just copies the DCT coefficients and performs
    the initial (non-)quantization. */
-static av_always_inline void dv_set_class_number_hd(DCTELEM* blk, EncBlockInfo* bi,
-                                                    const uint8_t* zigzag_scan, const int *weight, int bias)
+static av_always_inline void dv_set_class_number_hd(DCTELEM* blk, EncBlockInfo* bi, const uint8_t* zigzag_scan, const int *weight)
 {
     int prev, i, max = 0;
+    int l;
+
+    /* the EOB code is 4 bits */
+    bi->bit_size[0] = 4;
+    bi->bit_size[1] = bi->bit_size[2] = bi->bit_size[3] = 0;
 
     prev = 0;
     for (i = 1; i < 64; i++) {
@@ -807,20 +811,20 @@ static av_always_inline void dv_set_class_number_hd(DCTELEM* blk, EncBlockInfo* 
 
             if (level0 > max)
                 max = level0; 
+            l = level0; if (l > 255) l = 255; 
+            bi->bit_size[0] += dv_rl2vlc_size(i - prev - 1, l);
             bi->next[prev] = i;
             prev = i;
         }
     }
     bi->next[prev] = i;
 
-    /* the EOB code is 4 bits */
-    bi->bit_size[0] = 4;
-    bi->bit_size[1] = bi->bit_size[2] = bi->bit_size[3] = 0;
 
     /* ensure that no AC coefficients are cut off */
     bi->min_qlevel = ((max+256) >> 8);
+    bi->bit_size[0] += (bi->min_qlevel - 1)*1000000;
 
-    bi->area_q[0] = 25; /* set to an "impossible" value */
+    bi->area_q[0] = 1; /* set to an "impossible" value */
     bi->cno = 0;
 }
 
@@ -1120,7 +1124,7 @@ static av_always_inline int dv_init_enc_block(EncBlockInfo* bi, uint8_t *data, i
        } else {
            weight = !bias ? dv_weight_720_y : dv_weight_720_c;
        }
-       dv_set_class_number_hd(blk, bi, ff_zigzag_direct, weight, dv100_min_bias + bias*dv100_chroma_bias);
+       dv_set_class_number_hd(blk, bi, ff_zigzag_direct, weight);
        goto out;
     }
 
@@ -1179,6 +1183,11 @@ static inline void dv_guess_qnos(EncBlockInfo* blks, int* qnos)
     int size[5];
     int i, j, k, a, prev, a2;
     EncBlockInfo* b;
+
+    if (!blks[0].bit_size[1])
+        return dv_guess_qnos_hd(blks, qnos);
+
+    av_log(NULL, AV_LOG_ERROR, "broke from the jail\n");
 
     size[0] = size[1] = size[2] = size[3] = size[4] = 1 << 24;
     do {
@@ -1332,11 +1341,18 @@ static int dv_encode_video_segment(AVCodecContext *avctx, void *arg)
         }
     }
 
-    if (DV_PROFILE_IS_HD(s->sys)) {
-        dv_guess_qnos_hd(&enc_blks[0], qnosp);
-    } else {
-    if (vs_total_ac_bits < vs_bit_size)
+
+    if (((68*6 + 52*2) * 5 < vs_bit_size)) {
         dv_guess_qnos(&enc_blks[0], qnosp);
+    } else {
+        // for (i=j=0; j<5*s->sys->bpm; j++)
+        //    i += dv100_store_quantize(&enc_blks[j], 1);
+        // if (i != vs_bit_size)
+        //    av_log(NULL, AV_LOG_ERROR, "before %d  after %d\n", vs_bit_size, i);
+        // dv_guess_qnos(&enc_blks[0], qnosp);
+        // if (qnos[0] != 1 || qnos[1] != 1 || qnos[2] != 1 || qnos[3] != 1 || qnos[4] != 1)
+        //    av_log(NULL, AV_LOG_ERROR, "%d %d %d %d %d\n", qnos[0], qnos[1], qnos[2], qnos[3], qnos[4]);
+        qnos[0] = qnos[1] = qnos[2] = qnos[3] = qnos[4] = 1;
     }
 
     /* DIF encoding process */
